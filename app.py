@@ -9,14 +9,17 @@ import threading
 from datetime import datetime, date
 from flask import (
     Flask, render_template, request, redirect, url_for,
-    flash, jsonify, g
+    flash, jsonify, g, session
 )
+import bcrypt
+import shutil
 
 # ---------------------------------------------------------------------------
 # App configuration
 # ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE = os.path.join(BASE_DIR, "advisor.db")
+AUTH_DATABASE = os.path.join(BASE_DIR, "auth.db")
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "advisor-app-secret-key-change-me")
@@ -25,10 +28,19 @@ app.secret_key = os.environ.get("SECRET_KEY", "advisor-app-secret-key-change-me"
 # Database helpers
 # ---------------------------------------------------------------------------
 
+def get_auth_db():
+    if "auth_db" not in g:
+        g.auth_db = sqlite3.connect(AUTH_DATABASE)
+        g.auth_db.row_factory = sqlite3.Row
+        g.auth_db.execute("PRAGMA journal_mode=WAL")
+    return g.auth_db
+
 def get_db():
     """Open a new database connection per-request (stored on `g`)."""
     if "db" not in g:
-        g.db = sqlite3.connect(DATABASE)
+        user_id = session.get("user_id")
+        db_path = DATABASE if not user_id else os.path.join(BASE_DIR, f"advisor_{user_id}.db")
+        g.db = sqlite3.connect(db_path)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA journal_mode=WAL")
         g.db.execute("PRAGMA foreign_keys=ON")
@@ -40,11 +52,26 @@ def close_db(exception):
     db = g.pop("db", None)
     if db is not None:
         db.close()
+    auth_db = g.pop("auth_db", None)
+    if auth_db is not None:
+        auth_db.close()
 
+def init_auth_db():
+    db = sqlite3.connect(AUTH_DATABASE)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    db.close()
 
-def init_db():
+def init_db(db_path=DATABASE):
     """Create all tables and seed default data on first run."""
-    db = sqlite3.connect(DATABASE)
+    db = sqlite3.connect(db_path)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA foreign_keys=ON")
 
@@ -143,6 +170,85 @@ def init_db():
 
     db.close()
 
+
+# ---------------------------------------------------------------------------
+# Auth Middlewares and Routes
+# ---------------------------------------------------------------------------
+
+@app.before_request
+def require_login():
+    allowed_endpoints = ['login', 'register', 'static']
+    if request.endpoint not in allowed_endpoints and not session.get('user_id'):
+        return redirect(url_for('login'))
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').strip()
+
+        if not username or not password:
+            flash("Username and password are required.", "error")
+            return redirect(url_for('register'))
+
+        auth_db = get_auth_db()
+        
+        # Limit registration to 1 user for testing purposes
+        user_count = auth_db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if user_count >= 1:
+            flash("Registration is currently limited to 1 user for testing purposes.", "error")
+            return redirect(url_for('login'))
+
+        existing = auth_db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+        if existing:
+            flash("Username already exists.", "error")
+            return redirect(url_for('register'))
+
+        hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        
+        cur = auth_db.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username, hashed_pw)
+        )
+        auth_db.commit()
+        user_id = cur.lastrowid
+        
+        if user_id == 1 and os.path.exists(DATABASE):
+            shutil.copy(DATABASE, os.path.join(BASE_DIR, f"advisor_1.db"))
+        else:
+            init_db(os.path.join(BASE_DIR, f"advisor_{user_id}.db"))
+
+        flash("Registration successful. Please log in.", "success")
+        return redirect(url_for('login'))
+
+    return render_template('register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '').strip()
+
+        auth_db = get_auth_db()
+        user = auth_db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+
+        if user and bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
+            session.permanent = True
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            flash(f"Welcome back, {username}!", "success")
+            return redirect(url_for('dashboard'))
+        else:
+            flash("Invalid username or password.", "error")
+            return redirect(url_for('login'))
+
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash("You have been logged out.", "success")
+    return redirect(url_for('login'))
 
 # ---------------------------------------------------------------------------
 # Template context helpers
@@ -1344,6 +1450,7 @@ def api_category_breakdown():
 # Startup
 # ---------------------------------------------------------------------------
 
+init_auth_db()
 init_db()
 
 if __name__ == "__main__":
