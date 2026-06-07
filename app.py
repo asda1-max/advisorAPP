@@ -195,7 +195,7 @@ def register():
         
         # Limit registration to 1 user for testing purposes
         user_count = auth_db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        if user_count >= 1:
+        if user_count >= 5:
             flash("Registration is currently limited to 1 user for testing purposes.", "error")
             return redirect(url_for('login'))
 
