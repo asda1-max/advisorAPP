@@ -4,3 +4,5 @@ auth.db
 .env
 presets.json
 __pycache__/
+advisor_4.db
+/eek/*
