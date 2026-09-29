@@ -1,3 +1,6 @@
 advisor.db
 advisor_1.db
 auth.db
+.env
+presets.json
+__pycache__/

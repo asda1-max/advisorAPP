@@ -175,6 +175,17 @@
             color: var(--accent);
         }
 
+        .nav-links a.nav-logout {
+            color: var(--danger);
+            border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+            padding: 0.35rem 0.75rem;
+        }
+
+        .nav-links a.nav-logout:hover {
+            color: #fff;
+            background: var(--danger);
+        }
+
         /* ── Hamburger menu for mobile ── */
         .hamburger {
             display: none;
@@ -871,7 +882,7 @@
                 <li><a href="{{ url_for('categories') }}" class="{% if request.endpoint == 'categories' %}active{% endif %}">Categories</a></li>
                 <li><a href="{{ url_for('wishlist') }}" class="{% if request.endpoint == 'wishlist' %}active{% endif %}">Wishlist</a></li>
                 <li><a href="{{ url_for('stocks_page') }}" class="{% if request.endpoint == 'stocks_page' %}active{% endif %}">Stocks</a></li>
-                <li><a href="{{ url_for('logout') }}" style="color: var(--danger);">Logout</a></li>
+                <li><a href="{{ url_for('logout') }}" class="nav-logout" onclick="return confirm('Log out dari advisorAPP?')">Logout</a></li>
                 {% endif %}
             </ul>
             {% if session.get('user_id') %}
@@ -934,6 +945,10 @@
             <a href="{{ url_for('wishlist') }}" class="{% if request.endpoint == 'wishlist' %}active{% endif %}">
                 <span class="nav-icon">✦</span>
                 Wishlist
+            </a>
+            <a href="{{ url_for('logout') }}" onclick="return confirm('Log out dari advisorAPP?')">
+                <span class="nav-icon">⏻</span>
+                Logout
             </a>
         </div>
     </nav>

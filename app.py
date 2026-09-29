@@ -195,7 +195,7 @@ def register():
         
         # Limit registration to 1 user for testing purposes
         user_count = auth_db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        if user_count >= 1:
+        if user_count >= 20:
             flash("Registration is currently limited to 1 user for testing purposes.", "error")
             return redirect(url_for('login'))
 
@@ -1453,5 +1453,23 @@ def api_category_breakdown():
 init_auth_db()
 init_db()
 
+
+def _start_telegram_bot():
+    """Boot the Telegram bot alongside the web app (opt-out via TELEGRAM_BOT=off)."""
+    if os.environ.get("TELEGRAM_BOT", "on").lower() in ("off", "0", "false"):
+        return
+    try:
+        from telegram_bot import start_bot_in_thread
+        start_bot_in_thread()
+    except Exception as exc:
+        print(f"[bot] gagal start: {exc}")
+
+
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    debug = os.environ.get("FLASK_DEBUG", "1").lower() not in ("0", "false", "off")
+    app.debug = debug
+    # Start the bot exactly once: in the reloader child when debug is on,
+    # otherwise in the single process. Skip in the reloader monitor parent.
+    if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        _start_telegram_bot()
+    app.run(debug=debug, host="0.0.0.0", port=5000)
