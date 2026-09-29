@@ -20,7 +20,7 @@ import re
 import sqlite3
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import bcrypt
 import requests
@@ -131,19 +131,16 @@ def parse_message(text):
 def load_presets():
     """Load presets, seeding defaults on first run."""
     with _PRESET_LOCK:
-        presets = {}
-        if os.path.exists(PRESETS_FILE):
-            try:
-                with open(PRESETS_FILE, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-                if isinstance(data, dict):
-                    presets = data
-            except (OSError, ValueError):
-                presets = {}
-        if not presets:
+        if not os.path.exists(PRESETS_FILE):
             presets = dict(DEFAULT_PRESETS)
             _write_presets(presets)
-        return presets
+            return presets
+        try:
+            with open(PRESETS_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else dict(DEFAULT_PRESETS)
+        except (OSError, ValueError):
+            return dict(DEFAULT_PRESETS)
 
 
 def _write_presets(presets):
@@ -161,6 +158,24 @@ def get_preset(name):
     if key in presets:
         return key, presets[key]
     return None
+
+
+def match_preset(text):
+    parts = (text or "").strip().split(maxsplit=1)
+    if not parts:
+        return None
+    match = get_preset(parts[0])
+    if not match:
+        return None
+    name, preset = match
+    amount = float(preset.get("amount", 0))
+    if len(parts) == 2:
+        override = parse_amount(parts[1])
+        if override:
+            amount = float(override)
+    if amount <= 0:
+        return None
+    return name, preset, amount
 
 
 def _category_id(db, kind, name):
@@ -337,17 +352,38 @@ def summary(user_id):
     return data
 
 
-def recent_entries(user_id, limit=10):
+def period_summary(user_id, start_date, end_date):
     db = get_user_db(user_id)
-    rows = db.execute("""
+    result = {}
+    for table, key in (("expenses", "expense"), ("income", "income")):
+        result[key] = db.execute(
+            f"SELECT COALESCE(SUM(amount), 0) AS total FROM {table} "
+            "WHERE date >= ? AND date <= ?",
+            (start_date.isoformat(), end_date.isoformat()),
+        ).fetchone()["total"]
+    db.close()
+    return result
+
+
+def recent_entries(user_id, limit=10, keyword=None):
+    db = get_user_db(user_id)
+    query = """
         SELECT * FROM (
             SELECT e.id, e.amount, e.description, e.date, c.name AS category, 'expense' AS kind, e.created_at
             FROM expenses e JOIN categories c ON e.category_id = c.id
             UNION ALL
             SELECT i.id, i.amount, i.description, i.date, ic.name AS category, 'income' AS kind, i.created_at
             FROM income i JOIN income_categories ic ON i.category_id = ic.id
-        ) ORDER BY created_at DESC LIMIT ?
-    """, (limit,)).fetchall()
+        )
+    """
+    params = []
+    if keyword:
+        query += " WHERE description LIKE ? OR category LIKE ?"
+        pattern = f"%{keyword}%"
+        params.extend((pattern, pattern))
+    query += " ORDER BY date DESC, created_at DESC LIMIT ?"
+    params.append(max(1, min(int(limit), 50)))
+    rows = db.execute(query, params).fetchall()
     db.close()
     return rows
 
@@ -397,7 +433,19 @@ class TelegramBot:
             return {"ok": False}
 
     def send(self, chat_id, text):
-        self.call("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
+        self.call(
+            "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+            reply_markup={
+                "keyboard": [
+                    [{"text": "sangu"}, {"text": "/saldo"}],
+                    [{"text": "/mingguan"}, {"text": "/bulanan"}],
+                    [{"text": "/lapor"}, {"text": "/undo"}],
+                    [{"text": "/help"}, {"text": "/logout"}],
+                ],
+                "resize_keyboard": True,
+                "is_persistent": True,
+            },
+        )
 
     def handle(self, message):
         chat_id = message["chat"]["id"]
@@ -445,7 +493,10 @@ class TelegramBot:
                 "/preset del nama\n\n"
                 "<b>Perintah</b>\n"
                 "/saldo - ringkasan hari & bulan ini\n"
-                "/lapor - 10 transaksi terakhir\n"
+                "/mingguan - ringkasan minggu ini\n"
+                "/bulanan - ringkasan bulan ini\n"
+                "/lapor [jumlah] - transaksi terakhir (maks. 50)\n"
+                "/cari kata - cari transaksi\n"
                 "/undo - batalkan input terakhir\n"
                 "/kategori - daftar kategori\n"
                 "/id - chat id kamu\n"
@@ -470,8 +521,26 @@ class TelegramBot:
                 f"Masuk: {rupiah(s['month_income'])}\n"
                 f"Net: {rupiah(net_month)}"
             ))
+        elif command in ("/mingguan", "/minggu"):
+            today = date.today()
+            start = today - timedelta(days=today.weekday())
+            totals = period_summary(user_id, start, today)
+            self.send(chat_id, self.format_period_summary("Minggu ini", start, today, totals))
+        elif command in ("/bulanan", "/bulan"):
+            today = date.today()
+            start = today.replace(day=1)
+            totals = period_summary(user_id, start, today)
+            self.send(chat_id, self.format_period_summary("Bulan ini", start, today, totals))
         elif command == "/lapor":
-            rows = recent_entries(user_id, 10)
+            parts = text.split(maxsplit=1)
+            limit = 10
+            if len(parts) > 1:
+                try:
+                    limit = int(parts[1])
+                except ValueError:
+                    self.send(chat_id, "Format: <code>/lapor 15</code> (maksimal 50).")
+                    return
+            rows = recent_entries(user_id, limit)
             if not rows:
                 self.send(chat_id, "Belum ada transaksi.")
                 return
@@ -480,7 +549,23 @@ class TelegramBot:
                 sign = "-" if r["kind"] == "expense" else "+"
                 desc = r["description"] or r["category"]
                 lines.append(f"{r['date']}  {sign}{rupiah(r['amount'])}  {desc} ({r['category']})")
-            self.send(chat_id, "<b>10 transaksi terakhir</b>\n" + "\n".join(lines))
+            self.send(chat_id, f"<b>{len(rows)} transaksi terakhir</b>\n" + "\n".join(lines))
+        elif command == "/cari":
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                self.send(chat_id, "Format: <code>/cari makan</code>")
+                return
+            keyword = parts[1].strip()
+            rows = recent_entries(user_id, 20, keyword=keyword)
+            if not rows:
+                self.send(chat_id, f"Tidak ada transaksi yang cocok dengan ‘{keyword}’.")
+                return
+            lines = []
+            for row in rows:
+                sign = "-" if row["kind"] == "expense" else "+"
+                desc = row["description"] or row["category"]
+                lines.append(f"{row['date']} {sign}{rupiah(row['amount'])} {desc} ({row['category']})")
+            self.send(chat_id, f"<b>Hasil cari: {keyword}</b>\n" + "\n".join(lines))
         elif command == "/undo":
             last = undo_last(user_id)
             if last:
@@ -501,12 +586,12 @@ class TelegramBot:
             self.record(chat_id, user_id, text)
 
     def record(self, chat_id, user_id, text):
-        match = get_preset(text)
+        match = match_preset(text)
         if match:
-            name, preset = match
+            name, preset, amount = match
             parsed = {
                 "kind": preset.get("kind", "expense"),
-                "amount": float(preset.get("amount", 0)),
+                "amount": amount,
                 "description": preset.get("description", name),
                 "category": preset.get("category"),
             }
@@ -523,6 +608,16 @@ class TelegramBot:
             f"✅ {label} dicatat (#{entry_id})\n"
             f"{rupiah(parsed['amount'])} — {desc} [{category}]"
         ))
+
+    @staticmethod
+    def format_period_summary(title, start, end, totals):
+        net = totals["income"] - totals["expense"]
+        return (
+            f"<b>{title}</b> ({start.strftime('%d %b')}–{end.strftime('%d %b')})\n"
+            f"Keluar: {rupiah(totals['expense'])}\n"
+            f"Masuk: {rupiah(totals['income'])}\n"
+            f"Net: {rupiah(net)}"
+        )
 
     def cmd_preset(self, chat_id, text):
         parts = text.split()
