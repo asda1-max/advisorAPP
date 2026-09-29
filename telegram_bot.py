@@ -24,6 +24,7 @@ from datetime import date, datetime, timedelta
 
 import bcrypt
 import requests
+from html import escape
 
 _STARTED = False
 _START_LOCK = threading.Lock()
@@ -423,6 +424,7 @@ class TelegramBot:
         self.token = token
         self.offset = 0
         self.reminder_sent_on = None
+        self.wizards = {}
 
     def call(self, method, **payload):
         url = API.format(token=self.token, method=method)
@@ -432,20 +434,161 @@ class TelegramBot:
         except requests.RequestException:
             return {"ok": False}
 
-    def send(self, chat_id, text):
-        self.call(
-            "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
-            reply_markup={
-                "keyboard": [
-                    [{"text": "sangu"}, {"text": "/saldo"}],
-                    [{"text": "/mingguan"}, {"text": "/bulanan"}],
-                    [{"text": "/lapor"}, {"text": "/undo"}],
-                    [{"text": "/help"}, {"text": "/logout"}],
+    def main_keyboard(self):
+        return {
+            "keyboard": [
+                [{"text": "+ entries"}, {"text": "sangu"}],
+                [{"text": "/saldo"}, {"text": "/mingguan"}, {"text": "/bulanan"}],
+                [{"text": "/lapor"}, {"text": "/undo"}],
+                [{"text": "/help"}, {"text": "/logout"}],
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True,
+        }
+
+    def send(self, chat_id, text, inline_markup=None, show_menu=True):
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        if inline_markup is not None:
+            payload["reply_markup"] = inline_markup
+        elif show_menu:
+            payload["reply_markup"] = self.main_keyboard()
+        self.call("sendMessage", **payload)
+
+    def inline_buttons(self, rows):
+        return {"inline_keyboard": rows}
+
+    def start_entries(self, chat_id):
+        self.wizards[chat_id] = {"step": "kind"}
+        self.send(
+            chat_id,
+            "Mau catat apa?",
+            inline_markup=self.inline_buttons([
+                [
+                    {"text": "💸 Pengeluaran", "callback_data": "entry:kind:expense"},
+                    {"text": "💰 Pemasukan", "callback_data": "entry:kind:income"},
                 ],
-                "resize_keyboard": True,
-                "is_persistent": True,
-            },
+                [{"text": "Batal", "callback_data": "entry:cancel"}],
+            ]),
         )
+
+    def handle_callback(self, callback):
+        chat_id = callback.get("message", {}).get("chat", {}).get("id")
+        message_id = callback.get("message", {}).get("message_id")
+        callback_id = callback.get("id")
+        data = callback.get("data", "")
+        self.call("answerCallbackQuery", callback_query_id=callback_id)
+        if chat_id is None:
+            return
+
+        user = linked_user(chat_id)
+        if user is None:
+            self.wizards.pop(chat_id, None)
+            self.send(chat_id, "Sesi bot tidak aktif. Login lagi dengan /login.")
+            return
+
+        if data == "entry:cancel":
+            self.wizards.pop(chat_id, None)
+            self.send(chat_id, "Input dibatalkan.")
+            return
+
+        state = self.wizards.get(chat_id)
+        if data == "entry:again":
+            self.start_entries(chat_id)
+            return
+        if data == "entry:done":
+            self.wizards.pop(chat_id, None)
+            self.send(chat_id, "Siap. Kalau mau catat lagi, tekan + entries.")
+            return
+        if not state:
+            self.send(chat_id, "Sesi input sudah habis. Tekan + entries untuk mulai lagi.")
+            return
+
+        if data.startswith("entry:kind:") and state.get("step") == "kind":
+            kind = data.rsplit(":", 1)[-1]
+            if kind not in ("expense", "income"):
+                self.send(chat_id, "Jenis transaksi tidak dikenal.")
+                return
+            state.update({"kind": kind, "step": "name"})
+            label = "pengeluaran" if kind == "expense" else "pemasukan"
+            self.send(chat_id, f"Tulis nama {label} ya. Contoh: <code>makan bakso</code>")
+            return
+
+        if data.startswith("entry:category:") and state.get("step") == "category":
+            try:
+                category_id = int(data.rsplit(":", 1)[-1])
+            except ValueError:
+                self.send(chat_id, "Kategori tidak valid. Mulai lagi dengan + entries.")
+                self.wizards.pop(chat_id, None)
+                return
+
+            db = get_user_db(user["id"])
+            table = "categories" if state["kind"] == "expense" else "income_categories"
+            category = db.execute(
+                f"SELECT id, name FROM {table} WHERE id = ?", (category_id,)
+            ).fetchone()
+            db.close()
+            if not category:
+                self.send(chat_id, "Kategori tidak ditemukan. Mulai lagi dengan + entries.")
+                self.wizards.pop(chat_id, None)
+                return
+
+            parsed = {
+                "kind": state["kind"],
+                "amount": state["amount"],
+                "description": state["name"],
+                "category": category["name"],
+            }
+            entry_id, category_name, db, _ = add_entry(user["id"], parsed)
+            db.close()
+            self.wizards.pop(chat_id, None)
+            label = "Pengeluaran" if parsed["kind"] == "expense" else "Pemasukan"
+            name = escape(parsed["description"])
+            self.send(
+                chat_id,
+                f"✅ {label} dicatat (#{entry_id})\n{rupiah(parsed['amount'])} — {name} [{escape(category_name)}]",
+                inline_markup=self.inline_buttons([[
+                    {"text": "Catat lagi", "callback_data": "entry:again"},
+                    {"text": "Selesai", "callback_data": "entry:done"},
+                ]]),
+            )
+
+    def handle_wizard_text(self, chat_id, user_id, text):
+        state = self.wizards.get(chat_id)
+        if not state:
+            return False
+        if state["step"] == "name":
+            if not text.strip():
+                self.send(chat_id, "Nama transaksi tidak boleh kosong. Coba tulis namanya:")
+                return True
+            state["name"] = text.strip()
+            state["step"] = "amount"
+            self.send(chat_id, "Nominalnya berapa? Contoh: <code>10000</code> atau <code>15rb</code>")
+            return True
+        if state["step"] == "amount":
+            amount = parse_amount(text)
+            if amount is None or amount <= 0:
+                self.send(chat_id, "Nominal belum terbaca. Coba lagi, misalnya <code>10000</code> atau <code>15rb</code>.")
+                return True
+            state["amount"] = amount
+            state["step"] = "category"
+            db = get_user_db(user_id)
+            table = "categories" if state["kind"] == "expense" else "income_categories"
+            categories = db.execute(f"SELECT id, name FROM {table} ORDER BY name").fetchall()
+            db.close()
+            buttons = []
+            for index in range(0, len(categories), 2):
+                row = categories[index:index + 2]
+                buttons.append([
+                    {"text": category["name"], "callback_data": f"entry:category:{category['id']}"}
+                    for category in row
+                ])
+            buttons.append([{"text": "Batal", "callback_data": "entry:cancel"}])
+            self.send(chat_id, "Pilih kategorinya:", inline_markup=self.inline_buttons(buttons))
+            return True
+        if state["step"] == "category":
+            self.send(chat_id, "Pilih kategori lewat tombol di atas, atau tekan Batal.")
+            return True
+        return False
 
     def handle(self, message):
         chat_id = message["chat"]["id"]
@@ -478,10 +621,27 @@ class TelegramBot:
         user_id = user["id"]
         username = user["username"]
 
+        if chat_id in self.wizards:
+            if text.startswith("/"):
+                self.wizards.pop(chat_id, None)
+                if command not in ("/entries",):
+                    self.send(chat_id, "Input dibatalkan karena kamu memilih menu lain.")
+            else:
+                if text.lower() in ("+ entries", "entries"):
+                    self.start_entries(chat_id)
+                else:
+                    self.handle_wizard_text(chat_id, user_id, text)
+                return
+
+        if command == "/entries" or text.lower() in ("+ entries", "entries"):
+            self.start_entries(chat_id)
+            return
+
         if command in ("/help",):
             self.send(chat_id, (
                 f"<b>advisorAPP bot</b> — login sebagai {username}\n\n"
                 "Catat pengeluaran/pemasukan langsung dari chat:\n"
+                "• Tekan <code>+ entries</code> untuk input bertahap pakai tombol\n"
                 "• <code>makan 25000</code>\n"
                 "• <code>kopi 15rb</code>\n"
                 "• <code>+gaji 5jt</code> (income)\n"
@@ -721,6 +881,13 @@ class TelegramBot:
                 continue
             for update in result.get("result", []):
                 self.offset = update["update_id"] + 1
+                callback = update.get("callback_query")
+                if callback:
+                    try:
+                        self.handle_callback(callback)
+                    except Exception as exc:
+                        print(f"[bot] callback error: {exc}")
+                    continue
                 message = update.get("message") or update.get("edited_message")
                 if message:
                     try:
